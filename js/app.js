@@ -1042,9 +1042,10 @@ let draggingDocId = null;
 
   /** 滚到某个标题：减去顶栏高度，并走平滑滚动。 */
   function scrollToHeading(node) {
-    const top = Math.max(0, node.getBoundingClientRect().top + stage.scrollTop - 78);
-    if (typeof stage.scrollTo === 'function') stage.scrollTo({ top, behavior: 'smooth' });
-    else stage.scrollTop = top;
+    const scene = scrollScene();
+    const top = Math.max(0, node.getBoundingClientRect().top + scene.scrollTop - 78);
+    if (typeof scene.scrollTo === 'function') scene.scrollTo({ top, behavior: 'smooth' });
+    else scene.scrollTop = top;
   }
 
   /**
@@ -1085,6 +1086,8 @@ let draggingDocId = null;
   let savePositionTimer = 0;
   function scheduleSavePosition() {
     if (positionKey() === null) return;
+    // 编辑时不记"读到哪"：左边源码滚的是另一回事，记下来会把阅读位置弄乱
+    if (editing) return;
     clearTimeout(savePositionTimer);
     savePositionTimer = window.setTimeout(() => {
       try {
@@ -1109,8 +1112,9 @@ let draggingDocId = null;
 
   /** 滚动时：更新进度条、目录高亮，并（防抖）记住位置。 */
   function onScroll() {
-    const max = stage.scrollHeight - stage.clientHeight;
-    const ratio = max > 0 ? clamp(stage.scrollTop / max, 0, 1) : 0;
+    const scene = scrollScene();
+    const max = scene.scrollHeight - scene.clientHeight;
+    const ratio = max > 0 ? clamp(scene.scrollTop / max, 0, 1) : 0;
     $('progress-bar').style.width = (ratio * 100).toFixed(2) + '%';
     updateActiveHeading();
     scheduleSavePosition();
@@ -1242,10 +1246,12 @@ let draggingDocId = null;
        canPickFolder 还能不能"自己选一个文件夹"
        canDeepLink   地址栏能不能带 ?file=（只有服务模式能）
        list()        → 路径数组
-       read(path)    → { text, name, size }
+       read(path)    → { text, name, size, mtime? }
        fixImages(imgs, docPath)   把正文里的相对图片换成宿主取得到的地址
        heartbeat()   可选：定期告诉宿主"我还在"（服务端据此空闲退出）
        watch(cb)     可选：文件变了叫一声（将来做"保存即刷新"用）
+       canSave       能不能把编辑后的正文写回原文件；不能就只能"下载一份副本"
+       save(path, text, opts)  可选：写回原文件 → { size, mtime }；磁盘上变了就抛错（err.conflict）
   */
 
   /**
@@ -1274,6 +1280,7 @@ let draggingDocId = null;
       single: null,
       canPickFolder: true,
       canDeepLink: false,
+      canSave: false,   // 纯浏览器拿到的是"文件的一份拷贝"，改不回磁盘：只能下载副本
       async list() { return [] },
       async read() { throw new Error('这个模式下没有文件列表，读不了路径') },
       // file:// 下浏览器不允许网页读同目录的文件，相对图片只能保持原样（显示为破图）
@@ -1293,6 +1300,7 @@ let draggingDocId = null;
       single: null,
       canPickFolder: true,
       canDeepLink: false,
+      canSave: false,   // File 对象是只读的：文件夹模式下也只能下载副本
       async list() { return paths },
       async read(path) {
         const file = files.get(path);
@@ -1366,6 +1374,7 @@ let draggingDocId = null;
       skipDirs: Array.isArray(info.skipDirs) ? info.skipDirs : null,
       canPickFolder: true,
       canDeepLink: true,
+      canSave: true,   // 服务在本地跑，写回原文件是它的活儿（POST /api/save）
       async list() {
         if (!state.tree) return [];
         const query = state.root === null ? '' : '?root=' + encodeURIComponent(state.root);
@@ -1391,7 +1400,35 @@ let draggingDocId = null;
         }
         const data = await res.json();
         if (!res.ok || data.error !== undefined) throw new Error(data.error || '打不开这个文件');
-        return { text: data.text, name: data.name, size: data.size };
+        return { text: data.text, name: data.name, size: data.size, mtime: data.mtime };
+      },
+      /**
+       * 把编辑后的正文写回原文件。
+       * baseMtime 是"页面读到这一版时磁盘上的修改时间"：服务端发现磁盘上已经变了
+       * 就回 409、不覆盖（err.conflict = true），让调用方问一声再决定要不要强写。
+       * @param {string} path 工作区里的路径（正斜杠）
+       * @param {string} text 要写进去的正文
+       * @param {{ baseMtime?: number, force?: boolean }} [opts]
+       * @returns {Promise<{ size: number, mtime: number }>}
+       */
+      async save(path, text, opts = {}) {
+        let res;
+        try {
+          res = await fetch('api/save', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path, text, baseMtime: opts.baseMtime, force: opts.force === true }),
+          });
+        } catch {
+          throw new Error('保存失败：连不上本地服务');
+        }
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error !== undefined) {
+          const error = new Error(data.error || '保存失败');
+          error.conflict = res.status === 409;
+          throw error;
+        }
+        return { size: data.size, mtime: data.mtime };
       },
       async fixImages(imgs, docPath) {
         if (docPath === undefined) return;
@@ -1512,6 +1549,10 @@ let draggingDocId = null;
       setTree([]);   // 单篇形态：把上一位宿主留下的树清掉
     }
     if (typeof host.treeNote === 'string' && host.treeNote !== '') toast(host.treeNote);
+    // 编辑按钮看宿主：插件里没有"保存"这回事（它有自己的一套），就别露出来；
+    // 换宿主时如果正开着编辑，也要么退出去、要么按新宿主的能力重画。
+    if (host.id === 'vscode' && editing) setEditMode(false);
+    syncEditButton();
     applyEmptyState();
   }
 
@@ -1585,21 +1626,35 @@ let draggingDocId = null;
   /**
    * 打开一份文档（已在列表里就切过去，不会开两份）。
    * @param {string} text markdown 原文
-   * @param {{ key: string, name: string, size?: number, path?: string, source?: string }} meta 文档元信息
+   * @param {{ key: string, name: string, size?: number, path?: string, source?: string, mtime?: number }} meta 文档元信息
    */
   function openDoc(text, meta) {
+    /*
+      换行统一成 \n：textarea 自己就会把 \r\n 收成 \n，编辑器里拿到的永远是 \n。
+      但写回磁盘时要还原成文件原来的样子（Windows 上的 md 多数是 CRLF），
+      不然每保存一次，整篇的换行都变一遍，diff 会炸。所以把原来的换行记在 doc.eol 里。
+    */
+    const eol = text.includes('\r\n') ? '\r\n' : '\n';
+    const normalized = text.replace(/\r\n?/g, '\n');
     const existing = docs.find((doc) => doc.key === meta.key);
     if (existing !== undefined) {
-      // 同一份文件可能被重新打开（内容变过），刷新正文再切过去
-      existing.text = text;
+      // 同一份文件可能被重新打开（内容变过），刷新正文再切过去。
+      // 但**有未保存的改动时不要覆盖**：草稿比磁盘上的旧内容新，静默保留。
+      if (!isDirty(existing)) {
+        existing.text = normalized;
+        existing.savedText = normalized;
+        existing.size = meta.size || 0;
+        existing.path = meta.path;
+        existing.eol = eol;
+        existing.mtime = meta.mtime;
+      }
       existing.name = meta.name;
-      existing.size = meta.size || 0;
-      existing.path = meta.path;
       activateDoc(existing.id);
       return;
     }
     docSeq += 1;
-    const doc = Object.assign({ id: 'doc-' + docSeq, text, size: 0, source: 'file' }, meta);
+    // savedText = 磁盘上现在的内容；text 会随着编辑变。两者不等就是"有未保存的改动"。
+    const doc = Object.assign({ id: 'doc-' + docSeq, text: normalized, savedText: normalized, eol, size: 0, source: 'file' }, meta);
     docs.push(doc);
     activateDoc(doc.id);
   }
@@ -1618,7 +1673,7 @@ let draggingDocId = null;
     const next = docs.find((doc) => doc.id === id);
     if (next === undefined) return;
     const previous = activeDoc();
-    if (previous !== null && previous.id !== next.id) previous.scroll = stage.scrollTop;
+    if (previous !== null && previous.id !== next.id && !editing) previous.scroll = stage.scrollTop;
 
     activeDocId = next.id;
     currentDoc = next;
@@ -1642,13 +1697,22 @@ let draggingDocId = null;
     markActiveFile(next.path);
     closeSearch();
     void applyImages();
+    // 编辑态切文档：左边源码跟着换（草稿就在 doc.text 里，切走再切回来也还在）
+    if (editing) loadEditorFor(next);
+    syncDirtyView();
   }
 
   /** 关掉一份文档；关的是当前这篇就顺位切到邻居。 */
   function closeDoc(id) {
     const index = docs.findIndex((doc) => doc.id === id);
     if (index === -1) return;
-    const wasActive = docs[index].id === activeDocId;
+    const target = docs[index];
+    /*
+      只有"真的会丢东西"时才拦人：有未保存改动就问一句。
+      切文档不拦（草稿留在内存里），关文档才拦——这是最容易手滑丢内容的一步。
+    */
+    if (isDirty(target) && !window.confirm('「' + target.name + '」还有未保存的改动，关掉就没了。确定关闭吗？')) return;
+    const wasActive = target.id === activeDocId;
     docs.splice(index, 1);
     if (!wasActive) { renderDocList(); return }
     const neighbor = docs[index] || docs[index - 1] || null;
@@ -1666,6 +1730,7 @@ let draggingDocId = null;
 
   /** 一份文档都没有时的界面（空状态 + 清掉标题栏）。 */
   function showEmptyState() {
+    if (editing) setEditMode(false);
     activeDocId = null;
     currentDoc = null;
     content.textContent = '';
@@ -1680,6 +1745,7 @@ let draggingDocId = null;
     buildToc();
     renderDocList();
     markActiveFile(undefined);
+    syncDirtyView();
   }
 
   /** 渲染侧栏里的“打开的文档”列表（当前项高亮，右侧 × 关闭）。 */
@@ -1717,6 +1783,13 @@ let draggingDocId = null;
       name.className = 'name';
       name.textContent = doc.name;
       open.appendChild(name);
+      // 有没保存的改动就点一个小圆点（和浏览器标签页上的那个意思一样）
+      if (isDirty(doc)) {
+        const dot = document.createElement('span');
+        dot.className = 'doc-dirty';
+        dot.title = '有未保存的改动';
+        open.appendChild(dot);
+      }
       open.addEventListener('click', () => activateDoc(doc.id));
       row.appendChild(open);
 
@@ -1759,10 +1832,443 @@ let draggingDocId = null;
     try {
       const doc = await host.read(path);
       if (updateHash !== false && host.canDeepLink) setLocation(path);
-      openDoc(doc.text, { key: 'path:' + path, name: doc.name, size: doc.size, path, source: host.id });
+      openDoc(doc.text, { key: 'path:' + path, name: doc.name, size: doc.size, path, source: host.id, mtime: doc.mtime });
     } catch (error) {
       toast(error instanceof Error && error.message !== '' ? error.message : '读取失败');
     }
+  }
+
+  // ─────────────────────────── 7.5 编辑：源码 + 实时预览 ───────────────────────────
+  /*
+     编辑模式 = 把正文面板切成两半：左边 textarea 写源码，右边还是原来那套渲染。
+
+     为什么是 textarea 而不是引入一个编辑器库：
+       · 这个项目零构建、零依赖，多一个库就多一份要跟着升级的东西；
+       · 需要的功能很少（写、看、存），textarea 天生就能满足输入法、撤销、选择、快捷键；
+       · 语法颜色用 highlight.js 再叠一层 <pre> 就够了——它本来就在 vendor 里，渲染代码块用的就是它。
+
+     代价是两层必须严格对齐：同一个字体/字号/行高/内边距/tab-size，差一点都不行，
+     这些度量统一写在 styles/editor.css 的 .editor 上，靠继承传给三层。
+
+     保存：
+       · 服务模式（host.canSave）→ POST /api/save 真写回原文件；磁盘上的文件被别人改过会先问一句；
+       · 其它模式（单文件 HTML、拖进来的文件、文件夹模式）→ 浏览器写不回原文件，只能"下载一份副本"。
+  */
+
+  const mdPane = $('md-pane');
+  const editor = $('editor');
+  const editorInput = $('editor-input');
+  const editorHighlight = $('editor-highlight');
+  const editorHighlightCode = $('editor-highlight-code');
+  const editorGutterInner = $('editor-gutter-inner');
+  const editorMarker = $('editor-line-marker');
+  const editorDivider = $('editor-divider');
+  const docBox = $('doc');
+
+  /** 正开着编辑吗。 */
+  let editing = false;
+  /** 现在编辑器里装的是哪一篇（切文档时据此决定要不要把预览滚回顶部）。 */
+  let loadedDocId = null;
+  let previewTimer = 0;
+  let chromeTimer = 0;
+  let gutterLines = 0;
+  let gutterCurrent = -1;
+  /** 侧栏列表上次是按"脏/不脏"哪种状态画的（只在翻转时重画，别每敲一个字重建一遍 DOM）。 */
+  let dirtyShown = false;
+
+  /** 这份文档有没有没保存的改动。 */
+  function isDirty(doc) {
+    return doc !== null && doc !== undefined && typeof doc.savedText === 'string' && doc.text !== doc.savedText;
+  }
+
+  /** 现在该滚谁：编辑时滚右半边预览，平时滚整个舞台。 */
+  function scrollScene() {
+    return editing ? mdPane : stage;
+  }
+
+  /**
+   * 把"有未保存改动"画到界面上：顶栏的小标签、侧栏的小圆点、标签页标题前的圆点。
+   * @param {boolean} [force] 强制重画侧栏（内容变了但脏状态没变时用）
+   */
+  function syncDirtyView(force) {
+    const doc = activeDoc();
+    const dirty = isDirty(doc);
+    const state = $('save-state');
+    state.hidden = !dirty;
+    state.textContent = dirty ? '未保存 · Ctrl+S' : '';
+    if (doc !== null) document.title = (dirty ? '● ' : '') + doc.name + ' · Markdown Observer';
+    if (force === true || dirty !== dirtyShown) {
+      dirtyShown = dirty;
+      renderDocList();
+    }
+  }
+
+  /** 顶栏那两个按钮跟着宿主和编辑态变。 */
+  function syncEditButton() {
+    const btn = $('btn-edit');
+    // VSCode 插件自己有编辑/保存那一套，网页里再放一个只会打架
+    btn.hidden = host.id === 'vscode';
+    btn.setAttribute('aria-pressed', String(editing));
+    const label = editing ? '退出编辑（Ctrl+E）' : '编辑源码（Ctrl+E）';
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    $('btn-save').hidden = !editing;
+    $('btn-save').title = host.canSave === true
+      ? '保存到原文件（Ctrl+S）'
+      : '下载一份副本（Ctrl+S；这个模式写不回原文件）';
+  }
+
+  /**
+   * 进/出编辑模式。
+   * @param {boolean} on
+   */
+  function setEditMode(on) {
+    const doc = activeDoc();
+    if (on && doc === null) {
+      toast('先打开一篇文档，再开始编辑');
+      return;
+    }
+    if (on === editing) return;
+    /*
+      先记"读到哪儿"，再切布局：body[data-edit] 一改，舞台立刻变成不可滚动的两栏，
+      scrollTop 当场被夹成 0——读晚一步就只剩下 0 了。
+    */
+    if (on) doc.readScroll = stage.scrollTop;
+    editing = on;
+    document.body.dataset.edit = String(on);
+    editor.hidden = !on;
+    editorDivider.hidden = !on;
+    syncEditButton();
+
+    if (on) {
+      loadEditorFor(doc);
+      // 等一帧再量：布局刚从单栏变两栏，现在读到的行高才是真的
+      requestAnimationFrame(() => { updateEditorChrome(); syncEditorScroll() });
+      editorInput.focus({ preventScroll: true });
+    } else {
+      clearTimeout(previewTimer);
+      editorInput.blur();
+      /*
+        回到进编辑之前读到的那一行：readScroll 是进编辑那一刻的舞台位置。
+        doc.scroll 是"上一次离开这篇文档时"的位置，编辑中间切来切去也不会更新，
+        所以只当兜底（老文档/直接进编辑时没有 readScroll）。
+      */
+      const back = doc === null
+        ? 0
+        : (typeof doc.readScroll === 'number' ? doc.readScroll : (typeof doc.scroll === 'number' ? doc.scroll : 0));
+      requestAnimationFrame(() => {
+        stage.scrollTop = back;
+        onScroll();
+      });
+    }
+    syncDirtyView(true);
+  }
+
+  /** 把某份文档装进编辑器。切文档、刚进编辑模式都走这里。 */
+  function loadEditorFor(doc) {
+    if (doc === null) return;
+    const changed = loadedDocId !== doc.id;
+    loadedDocId = doc.id;
+    editorInput.value = doc.text;
+    applySplit(doc);
+    gutterLines = 0;   // 换文档了：行号整块重建
+    gutterCurrent = -1;
+    updateEditorChrome();
+    syncEditorScroll();
+    if (changed) mdPane.scrollTop = 0;
+  }
+
+  /** 把文档记着的比例写到 CSS 变量上（分隔条拖动时也走这里）。 */
+  function applySplit(doc) {
+    const ratio = typeof doc.split === 'number' ? clamp(doc.split, 0.25, 0.75) : 0.5;
+    docBox.style.setProperty('--edit-split', (ratio * 100).toFixed(1) + '%');
+    editorDivider.setAttribute('aria-valuenow', String(Math.round(ratio * 100)));
+    editorDivider.setAttribute('aria-valuemin', '25');
+    editorDivider.setAttribute('aria-valuemax', '75');
+  }
+
+  function setSplit(doc, ratio) {
+    if (doc === null) return;
+    doc.split = clamp(ratio, 0.25, 0.75);
+    applySplit(doc);
+  }
+
+  /** 高亮层和行号要改的时候走这里：敲字很快，合并一下，别每个按键都跑一遍 hljs。 */
+  function scheduleEditorChrome() {
+    clearTimeout(chromeTimer);
+    chromeTimer = window.setTimeout(updateEditorChrome, 40);
+  }
+
+  /**
+   * 重画高亮层 + 行号 + 当前行。
+   *
+   * 高亮层末尾必须补一个 '\n'：<pre> 会把最后一个换行吞掉，
+   * 不补的话光标落在最后一行时，看到的字和真正的位置差一行。
+   */
+  function updateEditorChrome() {
+    if (!editing) return;
+    const text = editorInput.value;
+    let html;
+    try {
+      html = hljs.getLanguage('markdown') !== undefined
+        ? hljs.highlight(text, { language: 'markdown', ignoreIllegals: true }).value
+        : escapeHtmlText(text);
+    } catch {
+      html = escapeHtmlText(text);   // 高亮失败也得让字显示出来
+    }
+    editorHighlightCode.innerHTML = html + '\n';
+    renderGutter();
+    updateCurrentLine();
+  }
+
+  /** 兜底转义：hljs 自己会转义，只有它不出手时才用得上。 */
+  function escapeHtmlText(text) {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /** 行号：行数变了才重建（一篇几千行的 md 也不会每次按键都重建）。 */
+  function renderGutter() {
+    const count = editorInput.value.split('\n').length;
+    if (count === gutterLines) return;
+    gutterLines = count;
+    gutterCurrent = -1;
+    const parts = new Array(count);
+    for (let i = 0; i < count; i += 1) parts[i] = '<div class="editor-gutter-line">' + (i + 1) + '</div>';
+    editorGutterInner.innerHTML = parts.join('');
+  }
+
+  /** 光标在第几行（0 开始）。 */
+  function caretLine() {
+    const before = editorInput.value.slice(0, editorInput.selectionStart);
+    let line = 0;
+    for (let i = before.indexOf('\n'); i !== -1; i = before.indexOf('\n', i + 1)) line += 1;
+    return line;
+  }
+
+  /** 当前行的高亮条 + 行号里那一行的加重。 */
+  function updateCurrentLine() {
+    if (!editing) return;
+    const style = window.getComputedStyle(editorHighlight);
+    const lineHeight = Number.parseFloat(style.lineHeight) || 22;
+    const padTop = Number.parseFloat(style.paddingTop) || 0;
+    const line = caretLine();
+    editorMarker.style.height = lineHeight + 'px';
+    editorMarker.style.transform = 'translateY(' + (padTop + line * lineHeight - editorInput.scrollTop) + 'px)';
+    if (line !== gutterCurrent) {
+      const previous = editorGutterInner.children[gutterCurrent];
+      if (previous !== undefined) previous.classList.remove('current');
+      const next = editorGutterInner.children[line];
+      if (next !== undefined) next.classList.add('current');
+      gutterCurrent = line;
+    }
+  }
+
+  /** textarea 滚了，把高亮层和行号一起推过去——三层永远看同一个位置。 */
+  function syncEditorScroll() {
+    if (!editing) return;
+    editorHighlight.scrollTop = editorInput.scrollTop;
+    editorHighlight.scrollLeft = editorInput.scrollLeft;
+    editorGutterInner.style.transform = 'translateY(' + (-editorInput.scrollTop) + 'px)';
+    updateCurrentLine();
+  }
+
+  /** 预览的刷新合并 160ms：一边打字一边整篇重渲染，打字会一顿一顿的。 */
+  function schedulePreview() {
+    clearTimeout(previewTimer);
+    previewTimer = window.setTimeout(refreshPreview, 160);
+  }
+
+  /** 按当前源码重画右半边（目录、字数、搜索标记一起更新）。 */
+  function refreshPreview() {
+    const doc = activeDoc();
+    if (!editing || doc === null) return;
+    // 记一个百分比：重画之后内容高度变了，按比例还原，眼睛不容易丢位置
+    const before = mdPane.scrollHeight - mdPane.clientHeight;
+    const ratio = before > 0 ? clamp(mdPane.scrollTop / before, 0, 1) : 0;
+    renderMarkdown(doc.text);
+    buildToc();
+    updateDocMeta(doc);
+    if (!$('searchbar').hidden && $('search-input').value.trim() !== '') runSearch($('search-input').value);
+    void applyImages();
+    const after = Math.max(0, mdPane.scrollHeight - mdPane.clientHeight);
+    mdPane.scrollTop = ratio * after;
+    onScroll();
+  }
+
+  /** 编辑器里改了内容之后统一走这里（输入、Tab 缩进都算）。 */
+  function applyEditorText() {
+    const doc = activeDoc();
+    if (!editing || doc === null) return;
+    doc.text = editorInput.value;
+    scheduleEditorChrome();
+    schedulePreview();
+    syncDirtyView();
+  }
+
+  /**
+   * 保存当前文档。
+   * @param {object|null} doc
+   */
+  async function saveDoc(doc) {
+    if (doc === null) {
+      toast('还没有打开文档');
+      return;
+    }
+    if (!isDirty(doc)) {
+      toast('没有需要保存的改动');
+      return;
+    }
+    // 编辑器里统一是 \n，写回去还成文件原来的换行（Windows 上的 md 多数是 CRLF）
+    const text = doc.eol === '\r\n' ? doc.text.replace(/\n/g, '\r\n') : doc.text;
+
+    if (host.canSave === true && typeof host.save === 'function' && typeof doc.path === 'string') {
+      try {
+        const result = await host.save(doc.path, text, { baseMtime: doc.mtime, force: false });
+        markSaved(doc, result);
+      } catch (error) {
+        // 409：读的时候和写的时候磁盘上的文件不是同一版（别的编辑器存过了）
+        if (error instanceof Error && error.conflict === true) {
+          const overwrite = window.confirm('磁盘上的文件已经被别处改过了。\n\n还要用编辑器里的这一版覆盖它吗？');
+          if (!overwrite) {
+            toast('没有覆盖。你的改动还在页面里，可以另存副本');
+            return;
+          }
+          try {
+            markSaved(doc, await host.save(doc.path, text, { baseMtime: doc.mtime, force: true }));
+          } catch (second) {
+            toast(second instanceof Error ? second.message : '保存失败');
+          }
+          return;
+        }
+        toast(error instanceof Error && error.message !== '' ? error.message : '保存失败');
+      }
+      return;
+    }
+
+    // 写不回磁盘的宿主：给一份同名副本，让用户自己覆盖回去
+    downloadCopy(doc);
+  }
+
+  /** 保存成功后的收尾：磁盘上这一版就是现在的正文了。 */
+  function markSaved(doc, result) {
+    doc.savedText = doc.text;
+    if (result !== undefined) {
+      if (Number.isFinite(result.size)) doc.size = result.size;
+      if (Number.isFinite(result.mtime)) doc.mtime = result.mtime;
+    }
+    updateDocMeta(doc);
+    syncDirtyView(true);
+    toast('已保存 ' + doc.name);
+  }
+
+  /** 单文件 HTML / 拖进来的文件 / 文件夹模式：唯一能落盘的办法是下载一份副本。 */
+  function downloadCopy(doc) {
+    const blob = new Blob([doc.text], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = doc.name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+    // 副本已经存下来了，就别一直挂着"未保存"——这个模式下没有别的保存方式
+    doc.savedText = doc.text;
+    syncDirtyView(true);
+    toast('这个模式写不回原文件，已下载一份副本');
+  }
+
+  /** 编辑器自己的事件都在这里挂（启动时调一次）。 */
+  function bindEditing() {
+    $('btn-edit').addEventListener('click', () => { setEditMode(!editing) });
+    $('btn-save').addEventListener('click', () => { void saveDoc(activeDoc()) });
+
+    editorInput.addEventListener('input', applyEditorText);
+    editorInput.addEventListener('scroll', syncEditorScroll, { passive: true });
+    for (const type of ['keyup', 'mouseup', 'click', 'select']) editorInput.addEventListener(type, updateCurrentLine);
+    editorInput.addEventListener('blur', () => { syncDirtyView() });
+
+    /*
+      Tab：插两个空格；Shift+Tab：退一格；有选区时整段缩进。
+      Ctrl+Tab 不能吃——那是"切文档"的快捷键（见 bindKeys）。
+    */
+    editorInput.addEventListener('keydown', (event) => {
+      if (event.key !== 'Tab' || event.ctrlKey || event.metaKey || event.altKey) return;
+      event.preventDefault();
+      const value = editorInput.value;
+      const start = editorInput.selectionStart;
+      const end = editorInput.selectionEnd;
+      if (start === end && !event.shiftKey) {
+        editorInput.setRangeText('  ', start, end, 'end');
+        editorInput.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+      const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+      const lines = value.slice(lineStart, end).split('\n');
+      const shifted = event.shiftKey
+        ? lines.map((line) => line.replace(/^ {1,2}|\t/, ''))
+        : lines.map((line) => '  ' + line);
+      const replacement = shifted.join('\n');
+      editorInput.setRangeText(replacement, lineStart, end, 'end');
+      editorInput.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+
+    // ── 分隔条：拖动改比例，双击复位，方向键微调（键盘也能用）──
+    editorDivider.addEventListener('pointerdown', (event) => {
+      const doc = activeDoc();
+      if (!editing || doc === null) return;
+      event.preventDefault();
+      // 窄屏是上下堆叠，拖的是高度不是宽度
+      const stacked = window.matchMedia('(max-width: 899px)').matches;
+      const rect = docBox.getBoundingClientRect();
+      editorDivider.classList.add('dragging');
+      document.body.classList.add('col-resizing');
+      const move = (moveEvent) => {
+        const ratio = stacked
+          ? (moveEvent.clientY - rect.top) / rect.height
+          : (moveEvent.clientX - rect.left) / rect.width;
+        setSplit(doc, ratio);
+      };
+      const stop = () => {
+        editorDivider.classList.remove('dragging');
+        document.body.classList.remove('col-resizing');
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', stop);
+        window.removeEventListener('pointercancel', stop);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', stop);
+      window.addEventListener('pointercancel', stop);
+    });
+    editorDivider.addEventListener('dblclick', () => { setSplit(activeDoc(), 0.5) });
+    editorDivider.addEventListener('keydown', (event) => {
+      const doc = activeDoc();
+      if (doc === null) return;
+      const step = event.shiftKey ? 0.1 : 0.02;
+      const ratio = typeof doc.split === 'number' ? doc.split : 0.5;
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        setSplit(doc, ratio - step);
+      } else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+        event.preventDefault();
+        setSplit(doc, ratio + step);
+      }
+    });
+
+    // 预览半边自己滚的时候，进度条和目录高亮也要跟着走
+    let paneScrollQueued = false;
+    mdPane.addEventListener('scroll', () => {
+      if (!editing || paneScrollQueued) return;
+      paneScrollQueued = true;
+      requestAnimationFrame(() => { paneScrollQueued = false; onScroll() });
+    }, { passive: true });
+
+    // 关标签页/刷新时才拦人：有没保存的改动，让浏览器弹它自己那个"确定离开吗"
+    window.addEventListener('beforeunload', (event) => {
+      if (!docs.some((doc) => isDirty(doc))) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
   }
 
   // ── 侧栏文件树（可折叠，像 Unity 的层级面板） ──
@@ -1951,7 +2457,7 @@ let draggingDocId = null;
   function scrollToAnchor(anchor, updateHash) {
     const target = findHeading(anchor);
     if (target === null) return false;
-    const from = stage.scrollTop;
+    const from = scrollScene().scrollTop;
     scrollToHeading(target);
     flashTarget(target);
     showJumpChip(target.textContent || '', from);
@@ -1973,8 +2479,9 @@ let draggingDocId = null;
     chip.hidden = false;
     chip.classList.add('show');
     $('jump-back').onclick = () => {
-      if (typeof stage.scrollTo === 'function') stage.scrollTo({ top: returnTop, behavior: 'smooth' });
-      else stage.scrollTop = returnTop;
+      const scene = scrollScene();
+      if (typeof scene.scrollTo === 'function') scene.scrollTo({ top: returnTop, behavior: 'smooth' });
+      else scene.scrollTop = returnTop;
       hideJumpChip();
     };
     clearTimeout(jumpTimer);
@@ -2739,6 +3246,12 @@ let draggingDocId = null;
 
       if (mod && event.key.toLowerCase() === 'o') { event.preventDefault(); void pickFile(); return }
       if (mod && event.key.toLowerCase() === 'f') { event.preventDefault(); openSearch(); return }
+      /*
+        Ctrl/Cmd+S：保存。必须放在 typing 判断**之前**——编辑时焦点在 textarea 里，
+        不进这一条的话浏览器会自己弹"另存网页"，那就太难看了。
+      */
+      if (mod && event.key.toLowerCase() === 's') { event.preventDefault(); void saveDoc(activeDoc()); return }
+      if (mod && event.key.toLowerCase() === 'e') { event.preventDefault(); setEditMode(!editing); return }
       if (event.key === 'Escape') {
         if ($('lightbox').hidden === false) { closeLightbox(); return }
         if ($('searchbar').hidden === false) { closeSearch(); return }
@@ -2807,6 +3320,7 @@ let draggingDocId = null;
     bindControls();
     bindKeys();
     bindDnd();
+    bindEditing();
     renderDocList();
 
     // 锚点跳转与浏览器前进后退都靠 hashchange

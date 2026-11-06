@@ -1,0 +1,370 @@
+/* ============================================================================
+   editor.css —— 编辑模式：左边源码、右边预览。
+
+   只在 body[data-edit='true'] 时生效；退出编辑，下面这些规则全部不参与布局，
+   阅读态和以前一模一样（.doc 仍然是那张居中的玻璃面板）。
+
+   三层叠在一起是这里唯一需要小心的地方：
+     .editor-layers 里，行高亮条、高亮层 <pre>、真正的 <textarea> 必须像素级重合
+     ——同一个字体、同一个字号、同一个行高、同一份内边距、同一个 tab-size。
+     任何一条不同，光标就会和看到的字错位。所以这几条属性写在最外层 .editor 上，
+     靠继承传给三层，不要在下面某一层单独改。
+   ============================================================================ */
+
+/* ─────────────────────────── 1. 编辑态的舞台与面板 ─────────────────────────── */
+
+/* 编辑时舞台不再整页滚动：顶栏固定在上面，下面那块由源码/预览各自滚。 */
+body[data-edit='true'] .stage {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: 14px;
+  scroll-behavior: auto;
+}
+
+body[data-edit='true'] .topbar,
+body[data-edit='true'] .doc-foot {
+  flex: none;
+}
+
+body[data-edit='true'] .doc {
+  flex: 1 1 auto;
+  display: grid;
+  /* 左：源码占的比例（JS 写 --edit-split，默认一半）；中：分隔条；右：预览吃掉剩下的 */
+  grid-template-columns: minmax(0, var(--edit-split, 50%)) var(--edit-divider-w, 9px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-areas: 'source divider preview';
+  width: 100%;
+  max-width: none;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* 三个孩子各自认领一块：DOM 顺序是"预览、分隔条、源码"，窄屏堆叠时靠区域名把源码提到上面 */
+body[data-edit='true'] .md-pane {
+  grid-area: preview;
+}
+
+body[data-edit='true'] .editor {
+  grid-area: source;
+}
+
+body[data-edit='true'] .editor-divider {
+  grid-area: divider;
+}
+
+/* 预览半边：平时它是 .doc 里唯一的块，编辑时变成左边一列，自己滚。 */
+.md-pane {
+  min-width: 0;
+  min-height: 0;
+}
+
+body[data-edit='true'] .md-pane {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: clamp(16px, 2.4vw, 40px) clamp(16px, 2.8vw, 48px) 44px;
+  scrollbar-gutter: stable;
+}
+
+/* 窄屏：改成上下堆叠（源码在上、预览在下），分隔条变成横向的那一条。 */
+@media (max-width: 899px) {
+  body[data-edit='true'] .doc {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, var(--edit-split, 50%)) var(--edit-divider-w, 9px) minmax(0, 1fr);
+    grid-template-areas: 'source' 'divider' 'preview';
+  }
+
+  body[data-edit='true'] .md-pane {
+    padding: 16px 18px 28px;
+  }
+
+  .editor-divider {
+    cursor: row-resize;
+  }
+
+  .editor-divider::before {
+    inset: 3px 0 !important;
+  }
+}
+
+/* ─────────────────────────── 2. 分隔条 ─────────────────────────── */
+
+.editor-divider {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+}
+
+.editor-divider::before {
+  content: '';
+  position: absolute;
+  inset: 0 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 32%, transparent);
+  transition: background var(--dur-fast, 120ms) linear;
+}
+
+/* 正中间那道短竖条：不 hover 也知道这里能拖（不靠猜） */
+.editor-divider::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 28px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dsw-alias-label-tertiary) 70%, transparent);
+  transition: background var(--dur-fast, 120ms) linear;
+}
+
+.editor-divider:hover::before,
+.editor-divider:focus-visible::before,
+.editor-divider.dragging::before {
+  background: var(--dsw-alias-state-business-primary);
+}
+
+.editor-divider:hover::after,
+.editor-divider:focus-visible::after,
+.editor-divider.dragging::after {
+  background: var(--dsw-alias-state-business-primary);
+}
+
+.editor-divider:focus-visible::before {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--dsw-alias-state-business-primary) 26%, transparent);
+}
+
+/* 上下堆叠时那根握把跟着躺下来 */
+@media (max-width: 899px) {
+  .editor-divider::after {
+    width: 28px;
+    height: 2px;
+  }
+}
+
+/* 拖动分栏时别让浏览器顺手选中整页文字 */
+body.col-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+/* ─────────────────────────── 3. 源码半边 ─────────────────────────── */
+
+.editor {
+  /* 三层共用的度量：改这里一处，三层一起变 */
+  --edit-font: max(13px, calc(14px * var(--read-scale, 1)));
+  --edit-line: calc(var(--edit-font) * 1.72);
+  --edit-pad-y: 18px;
+  --edit-pad-x: 16px;
+  --edit-gutter-w: 52px;
+
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  font-family: var(--ds-font-family-code);
+  font-size: var(--edit-font);
+  line-height: var(--edit-line);
+  font-variant-ligatures: none;
+  tab-size: 2;
+  border-top-right-radius: inherit;
+  border-bottom-right-radius: inherit;
+  background: color-mix(in srgb, var(--dsw-alias-bg-base) 30%, transparent);
+}
+
+.editor[hidden],
+.editor-divider[hidden] {
+  display: none;
+}
+
+/* 行号：单独一列，自己不滚，靠内部那一层的 translateY 跟着正文走 */
+.editor-gutter {
+  position: relative;
+  flex: none;
+  width: var(--edit-gutter-w);
+  overflow: hidden;
+  padding: var(--edit-pad-y) 0;
+  border-right: 1px solid color-mix(in srgb, var(--dsw-alias-label-tertiary) 18%, transparent);
+  color: var(--dsw-alias-label-tertiary);
+  user-select: none;
+}
+
+.editor-gutter-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: var(--edit-pad-y) 0;
+  text-align: right;
+  will-change: transform;
+}
+
+.editor-gutter-line {
+  height: var(--edit-line);
+  line-height: var(--edit-line);
+  padding-right: 10px;
+  font-size: max(11px, calc(var(--edit-font) - 1px));
+  font-variant-numeric: tabular-nums;
+}
+
+.editor-gutter-line.current {
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 三层：自带滚动的那个是 textarea，另外两层由 JS 跟着它滚 */
+.editor-layers {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.editor-line-marker,
+.editor-highlight,
+.editor-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: var(--edit-pad-y) var(--edit-pad-x);
+  border: 0;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  letter-spacing: normal;
+  tab-size: inherit;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.editor-line-marker {
+  height: var(--edit-line);
+  padding: 0;
+  background: color-mix(in srgb, var(--dsw-alias-label-primary) 5.5%, transparent);
+  pointer-events: none;
+  will-change: transform;
+}
+
+.editor-highlight {
+  overflow: hidden;
+  color: var(--dsw-alias-label-secondary);
+  pointer-events: none;
+}
+
+.editor-highlight code {
+  font: inherit;
+  color: inherit;
+  background: none;
+  padding: 0;
+}
+
+/* 真正的输入框：字是透明的，只有光标和选区露出来，颜色全靠下面那层高亮 */
+.editor-input {
+  overflow: auto;
+  resize: none;
+  background: transparent;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: var(--dsw-alias-label-primary);
+  outline: none;
+  z-index: 1;
+}
+
+/* 选区用半透明底色：底下的彩色字还能透出来，不至于选一片就看不见字了 */
+.editor-input::selection {
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 30%, transparent);
+}
+
+.editor-input::-moz-selection {
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 30%, transparent);
+}
+
+/* 输入框自己的滚动条不用显示：滚的是内容，露出来会和行号挤在一起 */
+.editor-input {
+  scrollbar-width: thin;
+}
+
+/* ─────────────────────────── 4. 顶栏上的脏标记与保存 ─────────────────────────── */
+
+/*
+  .doc-meta 现在装两样东西：路径那行小字 + "未保存"小标签。
+  用 flex 让路径自己省略号、标签永远露着——路径很长时标签被挤出去就白做了。
+*/
+.topbar .doc-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.topbar .doc-meta > #doc-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.save-state {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 15px;
+  color: var(--dsw-alias-state-business-primary);
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent);
+}
+
+.save-state::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.save-state[hidden] {
+  display: none;
+}
+
+/* 侧栏里"打开的文档"那一行的小圆点：这篇有没保存的改动 */
+.doc-dirty {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-business-primary);
+}
+
+/* 保存按钮：跟着编辑态出现；不可保存的模式（单文件/拖入）照样能点，只是存副本 */
+#btn-save[hidden] {
+  display: none;
+}
+
+/* ─────────────────────────── 5. 打印 ─────────────────────────── */
+
+@media print {
+  body[data-edit='true'] .editor,
+  body[data-edit='true'] .editor-divider,
+  .save-state {
+    display: none !important;
+  }
+
+  body[data-edit='true'] .doc {
+    display: block;
+    overflow: visible;
+  }
+
+  body[data-edit='true'] .md-pane {
+    overflow: visible;
+    padding: 0;
+  }
+}

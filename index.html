@@ -23,6 +23,8 @@
   <!-- ⑤ 阅读器自己的壳与控件 -->
   <link rel="stylesheet" href="styles/reader.css">
   <link rel="stylesheet" href="styles/controls.css">
+  <!-- ⑤' 编辑模式（源码 + 预览分栏） -->
+  <link rel="stylesheet" href="styles/editor.css">
   <!-- ⑥ 可调参数：放在最后，覆盖上面所有默认值（改外观只改这一个文件） -->
   <link rel="stylesheet" href="styles/tuning.css">
 </head>
@@ -100,7 +102,7 @@
       <header class="topbar glass">
         <div class="title-wrap">
           <div class="doc-title" id="doc-title">还没有打开文档</div>
-          <div class="doc-meta" id="doc-meta">拖入 .md 文件，或按 Ctrl/Cmd+O 选择</div>
+          <div class="doc-meta"><span id="doc-meta">拖入 .md 文件，或按 Ctrl/Cmd+O 选择</span><span class="save-state" id="save-state" hidden>未保存</span></div>
         </div>
         <div class="tools">
           <button class="icon-btn" id="btn-search" type="button" title="文内搜索（/ 或 Ctrl+F）" aria-label="文内搜索">
@@ -117,6 +119,12 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
             </button>
           </div>
+          <button class="icon-btn" id="btn-edit" type="button" title="编辑源码（Ctrl+E）" aria-label="编辑源码" aria-pressed="false">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z"/><path d="M14.5 7.5 17 10"/></svg>
+          </button>
+          <button class="icon-btn" id="btn-save" type="button" title="保存（Ctrl+S）" aria-label="保存" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4h11l3 3v13H5z"/><path d="M9 4v6h6"/><path d="M8 20v-5h8v5"/></svg>
+          </button>
           <button class="icon-btn" id="btn-print" type="button" title="打印 / 导出 PDF（Ctrl+P）" aria-label="打印">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 9V4h10v5"/><rect x="4" y="9" width="16" height="7" rx="2"/><path d="M7 16h10v4H7z"/></svg>
           </button>
@@ -177,7 +185,23 @@
       </section>
 
       <article class="doc glass" id="doc">
-        <div class="markdown" id="content"></div>
+        <!-- 预览半边：编辑模式下和左边源码并排，平时独占 -->
+        <div class="md-pane" id="md-pane">
+          <div class="markdown" id="content"></div>
+        </div>
+
+        <!-- 分栏的分隔条：拖动改左右比例，双击复位 -->
+        <div class="editor-divider" id="editor-divider" role="separator" aria-label="拖动调整源码与预览的比例（双击复位）" tabindex="0" hidden></div>
+
+        <!-- 源码半边：行号 + 高亮层 + textarea，三层严格重叠 -->
+        <div class="editor" id="editor" hidden>
+          <div class="editor-gutter" id="editor-gutter" aria-hidden="true"><div class="editor-gutter-inner" id="editor-gutter-inner"></div></div>
+          <div class="editor-layers">
+            <div class="editor-line-marker" id="editor-line-marker" aria-hidden="true"></div>
+            <pre class="editor-highlight" id="editor-highlight" aria-hidden="true"><code id="editor-highlight-code"></code></pre>
+            <textarea class="editor-input" id="editor-input" wrap="off" spellcheck="false" aria-label="Markdown 源码"></textarea>
+          </div>
+        </div>
       </article>
 
       <footer class="doc-foot" id="doc-foot">
