@@ -212,7 +212,8 @@ node tools/win/make-package.mjs --node na/node-v24.21.0-win-arm64/node.exe
 
 ```sh
 node tools/win/install.mjs --dry-run    # 先看它打算干什么（一个字都不改）
-node tools/win/install.mjs              # 装
+node tools/win/install.mjs              # 装（WSL 模式：服务跑在 WSL 里）
+node tools/win/install.mjs --serve-from D:\path\to\repo   # 装（原生 node，直接跑这份工作副本）
 node tools/win/uninstall.mjs            # 卸
 node tools/win/build-launcher.mjs       # 只重编启动器
 ./tools/win/MarkdownObserver.exe 'C:\path\to\a.md'   # 绕开注册表，直接试启动器
@@ -231,15 +232,21 @@ node tools/win/build-launcher.mjs       # 只重编启动器
 ## 两个模式
 
 启动器是"配置驱动"的：它只认 `config.txt` 里的三行（`command` / `args` / `pathmap`），
-所以同一份启动器能伺候两种完全不同的跑法：
+所以同一份启动器能伺候三种不同的跑法：
 
-| | 本机开发（现在装的这个） | 要发给别人的那份 |
-|---|---|---|
-| `command` | `wsl.exe` | 包里自带的 `node.exe` |
-| 阅读器代码 | 仓库里这份，改完刷新就见效 | 复制一份进包里 |
-| `pathmap` | `wsl`（`C:\x` → `/mnt/c/x`） | `native` |
-| 前提 | 装了 WSL + node | 什么都不用装 |
-| 适合 | 改代码的时候 | 发给别人 |
+| | 本机开发（WSL） | 本机开发（原生 node） | 要发给别人的那份 |
+|---|---|---|---|
+| `command` | `wsl.exe` | 本机的 `node.exe` | 包里自带的 `node.exe` |
+| 阅读器代码 | 仓库里这份，改完刷新就见效 | 仓库里这份，`--quit` 重启服务就见效 | 复制一份进包里 |
+| `pathmap` | `wsl`（`C:\x` → `/mnt/c/x`） | `native` | `native` |
+| 前提 | 装了 WSL + node | 装了 node | 什么都不用装 |
+| 怎么装 | `node tools/win/install.mjs` | `node tools/win/install.mjs --serve-from <仓库>` | `make-package.mjs` |
+
+`--serve-from` 那条是给"不想为了改一行代码就重装一次"的人用的：注册表指向安装目录里的启动器，
+启动器再按 `config.txt` 去跑**工作副本**里的 `serve.mjs`。代价是这份工作副本不能挪——挪了
+`config.txt` 里的路径就断了（重新跑一次 `--serve-from` 即可）。
+改完代码要重启服务才生效：`"$env:LOCALAPPDATA\MarkdownObserver\MarkdownObserver.exe" --quit`，
+然后重新双击一篇。
 
 对外的那一份还没做。
 

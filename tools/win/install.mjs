@@ -10,10 +10,14 @@
  *        · "打开方式"列表里出现 Markdown Observer（ProgID + OpenWithProgids + Applications）
  *      不动你现在的 .md 默认程序——要不要把它设成默认，你自己在"打开方式"里选一次。
  *
- * 跑法（在 WSL 里跑；Windows 上暂时不行，因为启动器要调 wsl.exe）：
- *   node tools/win/install.mjs              # 装
- *   node tools/win/install.mjs --dry-run    # 只打印打算做什么，一个字都不改
- *   node tools/win/uninstall.mjs            # 卸
+ * 跑法：
+ *   node tools/win/install.mjs                    # 装（WSL 里跑：服务走 wsl.exe -> run-server.sh）
+ *   node tools/win/install.mjs --serve-from <仓库> # 装，并直接跑这份工作副本里的 serve.mjs（Windows 原生 node）
+ *   node tools/win/install.mjs --dry-run          # 只打印打算做什么，一个字都不改
+ *   node tools/win/uninstall.mjs                  # 卸
+ *
+ * --serve-from 是给"自己的开发机"用的：链接指的是工作副本，改完代码（--quit 重启服务）就生效，
+ * 不用重新安装；缺点是这个目录不能挪、也不能删，挪了就得重装一次。
  *
  * 这个"模式"只服务于"阅读器源码放在 WSL 里"的那台开发机。
  * 要发给别人的那份会用另一个模式（自带 node、不依赖 WSL），见 tools/win/README.md。
@@ -42,7 +46,25 @@ const VERB_LABEL = '用 Markdown Observer 阅读';
 const dirArg = process.argv.indexOf('--dir');
 const nodeArg = process.argv.indexOf('--node');
 const NATIVE_NODE = nodeArg >= 0 ? process.argv[nodeArg + 1] : null;
-const NATIVE = NATIVE_NODE !== null || process.platform === 'win32';
+/*
+  --serve-from <目录>：不复制一份阅读器进安装目录，而是直接跑某个工作副本里的 serve.mjs。
+  本机开发用的就是这个：改完代码只要重启服务（MarkdownObserver.exe --quit）就生效，
+  不用每次重新安装，也不会出现"安装目录里那份是几天前的"。
+  要求 <目录> 里有 serve.mjs（也就是仓库根目录）。
+*/
+const serveFromArg = process.argv.indexOf('--serve-from');
+const SERVE_FROM = serveFromArg >= 0 ? process.argv[serveFromArg + 1] : null;
+if (SERVE_FROM !== null) {
+  if (process.platform !== 'win32') {
+    console.error('--serve-from 只在 Windows 上能用：它配的是 Windows 那个启动器。');
+    process.exit(2);
+  }
+  if (!existsSync(join(SERVE_FROM, 'serve.mjs'))) {
+    console.error('--serve-from ' + SERVE_FROM + ' 里没有 serve.mjs：这个选项要指到阅读器仓库的根目录。');
+    process.exit(2);
+  }
+}
+const NATIVE = SERVE_FROM !== null || NATIVE_NODE !== null || process.platform === 'win32';
 
 /** 跑一个 Windows 命令，返回去掉 BOM 与换行的 stdout。 */
 function win(command, args) {
@@ -117,7 +139,8 @@ const runner = join(HERE, 'run-server.sh');
 
 console.log('Markdown Observer - install "Open with" (Windows)');
 console.log('  install dir : ' + installWin);
-console.log('  WSL         : ' + distro + ' / ' + user);
+if (SERVE_FROM !== null) console.log('  serve from  : ' + join(SERVE_FROM, 'serve.mjs') + '  (工作副本：改完代码重启服务就生效)');
+else if (!NATIVE) console.log('  WSL         : ' + distro + ' / ' + user);
 console.log('  reader repo : ' + REPO);
 console.log('');
 
@@ -182,7 +205,7 @@ console.log('- launcher  -> ' + installWin + '\\' + EXE_NAME);
 //  也不传 --idle：这是常驻的"总管后台"，本来就该一直待着。
 const args = NATIVE
   ? [   // 自带的 node.exe 直接跑 serve.mjs（没有 WSL 的那些弯弯绕）
-    installWin + '\\serve.mjs',
+    SERVE_FROM !== null ? join(SERVE_FROM, 'serve.mjs') : installWin + '\\serve.mjs',
     '--file', '{file}',
     '--port', String(PORT),
     '--quiet',
@@ -203,7 +226,9 @@ const config = [
   '# pathmap: wsl = convert C:\\x to /mnt/c/x; native = pass through to a Windows program',
   '# port   : service port; must match --port in args (the launcher probes it)',
   '# tray   : show the notification-area icon (on / off)',
-  'command = ' + (NATIVE ? (NATIVE_NODE ?? installWin + '\\node.exe') : 'wsl.exe'),
+  'command = ' + (NATIVE
+    ? (NATIVE_NODE ?? (SERVE_FROM !== null ? process.execPath : installWin + '\\node.exe'))
+    : 'wsl.exe'),
   'pathmap = ' + (NATIVE ? 'native' : 'wsl'),
   'port = ' + PORT,
   'tray = on',
@@ -216,7 +241,13 @@ if (DRY) {
 } else {
   writeFileSync(join(installWsl, 'config.txt'), config, 'utf8');
 }
-console.log('- config    -> config.txt (on double-click: wsl.exe -> run-server.sh --file {file} --port ' + PORT + ' --open)');
+console.log('- config    -> config.txt (on double-click: '
+  + (SERVE_FROM !== null
+    ? (process.execPath + ' ' + join(SERVE_FROM, 'serve.mjs') + ' --file {file} --port ' + PORT + ' --open')
+    : (NATIVE
+      ? ('node.exe ' + join(installWin, 'serve.mjs') + ' --file {file} --port ' + PORT + ' --open')
+      : ('wsl.exe -> run-server.sh --file {file} --port ' + PORT + ' --open')))
+  + ')');
 
 // ── 3. 注册表 ────────────────────────────────────────────────────────────
 const exeWin = installWin + '\\' + EXE_NAME;
