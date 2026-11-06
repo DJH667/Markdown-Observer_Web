@@ -2,11 +2,12 @@
 /**
  * md-reader 的本地服务（零依赖：只用 Node 内置模块）。
  *
- * 它干四件事：
+ * 它干五件事：
  *   1. 把阅读器自己的静态文件（index.html / styles / js / vendor）发给浏览器；
  *   2. 目录形态下提供目录树，让你在左侧浏览一个文件夹里的 md；
  *   3. 按路径读正文与图片；
- *   4. 常驻，并且能把"打开这一篇"推给已经开着的页面（SSE）。
+ *   4. 把页面里编辑好的正文写回原文件（POST /api/save，编辑模式用）；
+ *   5. 常驻，并且能把"打开这一篇"推给已经开着的页面（SSE）。
  *
  * 用法：
  *   node serve.mjs                       # 目录形态：服务当前目录，左侧有文件树
@@ -24,7 +25,7 @@
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -136,6 +137,8 @@ const DEFAULT_SKIP_DIRS = ['node_modules', '.git', '.cache', 'dist', 'build', 'o
 /** 扫描上限：误点了一个巨大（或很深）的文件夹时，别把界面拖死，列到上限就停并标记 capped。 */
 const MAX_TREE_FILES = 5000
 const MAX_TREE_MS = 4000
+/** 保存正文的上限：一篇 markdown 不该有几个 MB，超了多半是发错了地方，直接拒掉。 */
+const MAX_SAVE_BYTES = 5 * 1024 * 1024
 /** 静态文件允许的扩展名 → content-type。 */
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -219,6 +222,26 @@ function json(res, status, body) {
   const text = JSON.stringify(body)
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(text)
+}
+
+/**
+ * 收下一个请求的正文（JSON 用）。
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} limit 最多收多少字节
+ * @returns {Promise<string|null>} 收到的正文；超过 limit 时返回 null（顺手把连接断掉）
+ */
+async function readBody(req, limit) {
+  const chunks = []
+  let size = 0
+  for await (const chunk of req) {
+    size += chunk.length
+    if (size > limit) {
+      req.destroy()
+      return null
+    }
+    chunks.push(chunk)
+  }
+  return Buffer.concat(chunks).toString('utf8')
 }
 
 /**
@@ -306,7 +329,7 @@ function hostOk(req) {
   会"改变状态"的接口：跨站请求一律拒绝（见 sameOrigin 的说明）。
   别的接口不用管：跨站读不到响应（我们不发 CORS 头），能造成实际影响的只有这些动作。
 */
-const MUTATING = new Set(['/api/open', '/api/root', '/api/pref', '/api/quit'])
+const MUTATING = new Set(['/api/open', '/api/root', '/api/pref', '/api/quit', '/api/save'])
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -405,6 +428,62 @@ const server = createServer(async (req, res) => {
         mtime: info.mtimeMs,
       });
       return;
+    }
+
+    // ── 接口：把编辑过的正文写回原文件（编辑模式的 Ctrl+S）
+    //
+    //   几条不肯让步的限制：
+    //     · 只能写**已经存在**的 markdown 文件——这个接口不是"新建文件"，也不碰别的类型；
+    //     · 只能写在白名单目录里（和读文件同一套 isAllowed 判断）；
+    //     · 大小有上限（MAX_SAVE_BYTES），免得网页一次塞进来半个硬盘；
+    //     · 跨站请求在 MUTATING 那一步就被挡了，别的网页没法借你的手改文件。
+    if (pathname === '/api/save') {
+      if (req.method !== 'POST') {
+        json(res, 405, { error: '保存只接受 POST' })
+        return
+      }
+      const raw = await readBody(req, MAX_SAVE_BYTES)
+      if (raw === null) {
+        json(res, 413, { error: '这篇太大了（超过 ' + (MAX_SAVE_BYTES / 1024 / 1024) + ' MB），没有保存' })
+        return
+      }
+      let payload
+      try {
+        payload = JSON.parse(raw)
+      } catch {
+        json(res, 400, { error: '保存请求不是合法的 JSON' })
+        return
+      }
+      const text = typeof payload?.text === 'string' ? payload.text : null
+      if (text === null) {
+        json(res, 400, { error: '保存请求里没有正文（text 必须是字符串）' })
+        return
+      }
+      const target = fromWire(String(payload.path ?? ''))
+      if (!MARKDOWN_EXT.has(extname(target).toLowerCase())) {
+        json(res, 400, { error: '只能保存 markdown 文件：' + basename(target) })
+        return
+      }
+      if (!isAllowed(target)) {
+        json(res, 400, { error: '这个文件不在你打开过的文件夹里，所以没保存：' + basename(target) })
+        return
+      }
+      const before = await stat(target)
+      if (!before.isFile()) {
+        json(res, 400, { error: '这不是一个文件：' + basename(target) })
+        return
+      }
+      // 页面记着上次读到的修改时间；磁盘上已经变了就说明别处改过它。
+      // 默认不覆盖（409 + force 才能硬写），免得把别的编辑器刚存的内容冲掉。
+      const baseMtime = typeof payload.baseMtime === 'number' ? payload.baseMtime : null
+      if (payload.force !== true && baseMtime !== null && Math.abs(before.mtimeMs - baseMtime) > 2) {
+        json(res, 409, { error: '磁盘上的文件已经被别处改过了，没有覆盖', mtime: before.mtimeMs })
+        return
+      }
+      await writeFile(target, text, 'utf8')
+      const after = await stat(target)
+      json(res, 200, { ok: true, path: toWire(target), size: after.size, mtime: after.mtimeMs })
+      return
     }
 
     // ── 接口：原样读一个文件（给文档里的相对图片用，不限于 markdown）
