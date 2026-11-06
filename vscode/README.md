@@ -9,6 +9,8 @@
   也可以点编辑器右上角的"眼睛"图标，或在命令面板里搜 "Markdown Observer"。
 - 想让阅读视图当默认：在 `settings.json` 里写
   `"workbench.editorAssociations": { "*.md": "markdownObserver.preview" }`。
+- **没有编辑模式**（顶栏那支铅笔与保存按钮在这里是隐藏的）：改字本来就是编辑器的事，
+  阅读视图只管看；让它也能改，等于和 VS Code 自己的 `Ctrl+S`、撤销栈、外部改动提示抢饭碗。
 
 ## 关键设计：不复制应用本体
 
