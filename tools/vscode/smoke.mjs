@@ -126,6 +126,9 @@ if (ready) {
   check('本页目录（#pane-toc）有内容', window.document.querySelectorAll('#pane-toc .toc-row').length >= 2,
     String(window.document.querySelectorAll('#pane-toc .toc-row').length) + ' 项');
   check('精简外壳的样式挂上了', window.document.querySelector('link[href*="vscode.css"]') !== null);
+  // 编辑/保存归编辑器自己（Ctrl+S 会跟编辑器抢），网页里那两个按钮在插件里必须藏起来
+  check('编辑器里没有"编辑源码"按钮', window.document.getElementById('btn-edit').hidden === true);
+  check('编辑器里没有"保存"按钮', window.document.getElementById('btn-save').hidden === true);
   check('宿主设置被套用（字号 110%、栏宽 700）',
     window.document.documentElement.style.getPropertyValue('--read-scale') === '1.1'
     && window.document.documentElement.style.getPropertyValue('--read-width') === '700px',

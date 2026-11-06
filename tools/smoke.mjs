@@ -16,8 +16,8 @@ import { execFileSync, spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { get as httpGet } from 'node:http';
-import { statSync, readdirSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, statSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join, sep } from 'node:path';
 
 const CHECKOUT = process.env.DSH_CHECKOUT ?? fileURLToPath(new URL('../../deepseek-harness-ayine/', import.meta.url));
 const require = createRequire(CHECKOUT + 'packages/client/ui-goal/package.json');
@@ -138,6 +138,24 @@ const options = {
     FakeEventSource.prototype.close = function () {};
     window.EventSource = FakeEventSource;
 
+    /*
+      编辑模式用到的两个浏览器能力 jsdom 没有：
+        · URL.createObjectURL —— "下载一份副本"靠它造 blob 地址；
+        · <a download>.click() —— jsdom 不会真下载，只会打一条"not implemented"。
+      这里补一个假地址，并把"带 download 的点击"截下来，测试据此断言确实下载了。
+    */
+    window.__downloads = [];
+    window.URL.createObjectURL = () => 'blob:md-reader-smoke';
+    window.URL.revokeObjectURL = () => {};
+    const anchorClick = window.HTMLAnchorElement.prototype.click;
+    window.HTMLAnchorElement.prototype.click = function () {
+      if (this.hasAttribute('download')) {
+        window.__downloads.push(this.getAttribute('download'));
+        return;
+      }
+      return anchorClick.call(this);
+    };
+
     // jsdom 里没有"选文件夹"这回事：静态模式下把假文件列表挂在 window 上，测试里再喂给 #folder-input
     if (!useServer) {
       window.__FAKE_FOLDER__ = fakeFolderFiles(window, {
@@ -199,7 +217,9 @@ if (useSingle) {
   const singleInfo = await (await fetch('http://127.0.0.1:' + PORT + '/api/info')).json();
   check('shape is single-file', singleInfo.shape, 'file');
   check('info.file points at the startup file (absolute)', singleInfo.file.endsWith('/sample.md'), true);
-  check('its folder is in the allow-list', singleInfo.roots.length >= 1 && singleInfo.roots[0].endsWith('/md-reader'), true);
+  // 别写成 endsWith('/md-reader')：仓库文件夹改个名字这条就假红一次（本项目就撞过）
+  const appWire = APP.replace(/[\\/]+$/, '').split(sep).join('/');
+  check('its folder is in the allow-list', singleInfo.roots.length >= 1 && singleInfo.roots[0] === appWire, true);
   const singleTree = await (await fetch('http://127.0.0.1:' + PORT + '/api/tree')).json();
   check('tree is empty', singleTree.files.length, 0);
   // 白名单是服务唯一的围栏，值得一条断言守着
@@ -636,6 +656,89 @@ if (useServer) {
   await sleep(200);
   check('two left after closing', id('doc-list').querySelectorAll('.doc-row').length, 2);
   check('closing the current item switches to its neighbor', id('doc-title').textContent, 'b.md');
+}
+
+/*
+  编辑模式（需求③）：左源码右预览。
+  jsdom 没有排版，量不了对齐——那是 tools/edit-check 那种真浏览器脚本的活；
+  这里守的是"状态机"：按钮、布局开关、打字→预览/目录、脏标记、草稿、保存去向。
+*/
+console.log('10) edit mode (source on the left, preview on the right)');
+{
+  const editorInput = id('editor-input');
+  check('edit button is visible outside the editor plugin', id('btn-edit').hidden, false);
+  check('save button is hidden until editing starts', id('btn-save').hidden, true);
+
+  id('btn-edit').click();
+  await sleep(200);
+  check('body switched to the edit layout', document.body.dataset.edit, 'true');
+  check('the editor shows up', id('editor').hidden, false);
+  check('the divider shows up', id('editor-divider').hidden, false);
+  check('the edit button reports the new state', id('btn-edit').getAttribute('aria-pressed'), 'true');
+  const source = editorInput.value;
+  check('the editor holds the markdown source', source.startsWith('# '), true);
+  check('line numbers match the line count', id('editor-gutter-inner').children.length, source.split('\n').length);
+  check('the source is syntax highlighted', id('editor-highlight-code').innerHTML.includes('hljs-'), true);
+
+  editorInput.value = source + '\n## 自测新增小节\n\n正文。\n';
+  editorInput.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await sleep(400);
+  check('the preview re-renders while typing', id('content').textContent.includes('自测新增小节'), true);
+  check('the outline re-renders while typing', id('toc').textContent.includes('自测新增小节'), true);
+  check('the unsaved badge shows up', id('save-state').hidden, false);
+  check('the dirty dot lands in the document list', id('doc-list').querySelectorAll('.doc-dirty').length, 1);
+  check('the tab title gets a dot', document.title.startsWith('●'), true);
+
+  key('e', { ctrlKey: true });
+  await sleep(200);
+  check('Ctrl+E leaves edit mode', document.body.dataset.edit, 'false');
+  check('the preview keeps the edit', id('content').textContent.includes('自测新增小节'), true);
+  key('e', { ctrlKey: true });
+  await sleep(200);
+  check('the draft survives leaving and coming back', editorInput.value.includes('自测新增小节'), true);
+
+  if (useServer) {
+    /*
+      服务模式真的写盘。为了不碰仓库里的文件，临时造一篇、写完就删。
+      这条链路是 serve.mjs 的 /api/save：白名单 + 扩展名 + mtime 冲突检测，三样都得守。
+    */
+    const dir = join(APP, '.tmp', 'smoke-save');
+    mkdirSync(dir, { recursive: true });
+    const tmp = join(dir, 'save.md');
+    writeFileSync(tmp, '# before\n', 'utf8');
+    const wire = tmp.split(sep).join('/');
+    const api = 'http://127.0.0.1:' + PORT;
+    const post = async (body) => fetch(api + '/api/save', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const loaded = await (await fetch(api + '/api/file?path=' + encodeURIComponent(wire))).json();
+    check('a save inside the workspace succeeds', (await post({ path: wire, text: '# after\n', baseMtime: loaded.mtime })).status, 200);
+    const reread = await (await fetch(api + '/api/file?path=' + encodeURIComponent(wire))).json();
+    check('the new text is on disk', reread.text, '# after\n');
+    check('a save with a stale mtime is refused (409)', (await post({ path: wire, text: '# stale\n', baseMtime: loaded.mtime })).status, 409);
+    check('a path outside the workspace is refused (400)', (await post({ path: 'C:/Windows/win.ini', text: 'x' })).status, 400);
+    check('a non-markdown path is refused (400)', (await post({ path: wire.replace(/\.md$/, '.exe'), text: 'x' })).status, 400);
+    check('a body without text is refused (400)', (await post({ path: wire, text: 42 })).status, 400);
+    check('a GET is refused (405)', (await fetch(api + '/api/save')).status, 405);
+    rmSync(dir, { recursive: true, force: true });
+  } else {
+    // 静态/单文件/文件夹模式拿不到可写句柄：Ctrl+S 只能下载一份副本
+    key('s', { ctrlKey: true });
+    await sleep(300);
+    check('Ctrl+S downloads a copy when the host cannot write back', window.__downloads.length, 1);
+    check('the copy keeps the file name', window.__downloads[0], id('doc-title').textContent);
+    check('the unsaved badge clears after the copy', id('save-state').hidden, true);
+    check('the dirty dot disappears too', id('doc-list').querySelectorAll('.doc-dirty').length, 0);
+  }
+
+  // 退出编辑，别把后面的用例留在两栏布局里
+  if (document.body.dataset.edit === 'true') {
+    id('btn-edit').click();
+    await sleep(150);
+  }
+  check('left edit mode again for the remaining suites', document.body.dataset.edit, 'false');
 }
 
 if (useServer) {
