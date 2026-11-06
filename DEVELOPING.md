@@ -199,9 +199,9 @@ jsdom 那三个不需要浏览器（`cwd` 用 dsh 源码目录，借它的 `jsdo
 ```sh
 cd deepseek-harness-ayine
 node ../md-reader/tools/check-styles.mjs                  # 保真度 + CSS 变量（秒级）
-node ../md-reader/tools/smoke.mjs                          # 静态模式 + 模拟文件夹模式（143 项断言）
-node ../md-reader/tools/smoke.mjs --server                 # 服务模式（143 项断言，含老设置迁移与 /api/save）
-node ../md-reader/tools/smoke.mjs --standalone             # 单文件分享版（150 项断言，需先跑 tools/build-standalone.mjs）
+node ../md-reader/tools/smoke.mjs                          # 静态模式 + 模拟文件夹模式（149 项断言）
+node ../md-reader/tools/smoke.mjs --server                 # 服务模式（149 项断言，含老设置迁移与 /api/save）
+node ../md-reader/tools/smoke.mjs --standalone             # 单文件分享版（156 项断言，需先跑 tools/build-standalone.mjs）
 DOC_ROOT=../sprite-plugin node ../md-reader/tools/smoke.mjs --server   # 用真实文档目录跑
 ```
 

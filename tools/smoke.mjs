@@ -659,6 +659,40 @@ if (useServer) {
 }
 
 /*
+  需求①：打开的文档可以拖动排序。行本身 draggable，监听挂在容器上
+  （行是重画出来的，逐个绑会漏）。jsdom 没有排版，getBoundingClientRect
+  全是 0，于是 clientY（0）> 半高（0）永远为假 = "插到这一行前面"，
+  正好是最常用的那半边。
+*/
+{
+  const rows = () => [...id('doc-list').querySelectorAll('.doc-row')];
+  const ids = () => rows().map((row) => row.dataset.docId);
+  const drag = (node, type, clientY = 0) => {
+    const event = new window.Event(type, { bubbles: true, cancelable: true });
+    // jsdom 没有 DragEvent 的 dataTransfer，handler 里两行 setData 需要它
+    Object.defineProperty(event, 'dataTransfer', { value: { effectAllowed: '', setData() {}, getData() { return '' } } });
+    Object.defineProperty(event, 'clientY', { value: clientY });
+    node.dispatchEvent(event);
+    return event;
+  };
+  const before = ids();
+  check('two documents to reorder', before.length >= 2, true);
+  const [firstRow, secondRow] = rows();
+  drag(secondRow, 'dragstart');
+  check('the dragged row is marked while dragging', secondRow.classList.contains('dragging'), true);
+  drag(firstRow, 'dragover');
+  check('the drop target shows which half it will land in', firstRow.classList.contains('drop-before'), true);
+  drag(firstRow, 'drop');
+  await sleep(120);
+  const after = ids();
+  check('dropping a document above another moves it to the front', after[0], before[1]);
+  check('the other document keeps its place in the list', after[1], before[0]);
+  drag(secondRow, 'dragend');
+  await sleep(60);
+  check('the drop hints are cleared after the drag ends', id('doc-list').querySelectorAll('.drop-before, .drop-after').length, 0);
+}
+
+/*
   编辑模式（需求③）：左源码右预览。
   jsdom 没有排版，量不了对齐——那是 tools/edit-check 那种真浏览器脚本的活；
   这里守的是"状态机"：按钮、布局开关、打字→预览/目录、脏标记、草稿、保存去向。
