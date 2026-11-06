@@ -18,6 +18,9 @@ tools/win/.argvprobe.*
 .markdown-observer.pid
 .md-reader.pid
 
+# 自测与真浏览器探针的草稿（smoke 会往 .tmp/ 里造一个临时文件试写盘）
+.tmp/
+
 .DS_Store
 Thumbs.db
 desktop.ini
